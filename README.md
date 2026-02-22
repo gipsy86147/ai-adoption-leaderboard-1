@@ -40,7 +40,26 @@ cp .env.local.example .env.local
 
 ### ⚙️ Configure Environment (PAT Mode for Local Dev)
 
-For local development, use a Personal Access Token:
+For local development, use a GitHub token. The easiest way is to use the **GitHub CLI** (`gh`), which you may already have authenticated:
+
+#### Option A: Use GitHub CLI token (Recommended)
+
+If you have the [GitHub CLI](https://cli.github.com/) installed and authenticated (`gh auth login`), you can use its token directly — no need to create a separate Personal Access Token:
+
+```bash
+# Copy your gh CLI token into .env.local
+echo "GITHUB_TOKEN=$(gh auth token)" > .env.local
+echo "GITHUB_REPOS=owner/repo1,owner/repo2" >> .env.local
+echo "AUTH_MODE_OVERRIDE=pat" >> .env.local
+```
+
+Or as a one-liner to get started quickly:
+
+```bash
+echo "GITHUB_TOKEN=$(gh auth token)\nGITHUB_REPOS=owner/repo1,owner/repo2\nAUTH_MODE_OVERRIDE=pat" > .env.local
+```
+
+#### Option B: Create a Personal Access Token
 
 1. Create a token at [GitHub Settings > Tokens](https://github.com/settings/tokens/new?scopes=repo,read:user)
 2. Update `.env.local`:
@@ -50,6 +69,8 @@ GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 GITHUB_REPOS=owner/repo1,owner/repo2
 AUTH_MODE_OVERRIDE=pat
 ```
+
+> **Note:** Replace `owner/repo1,owner/repo2` with the repositories you want to analyze (comma-separated).
 
 ### 🏁 Start Development
 
