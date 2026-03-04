@@ -182,6 +182,218 @@ interface GitHubCommit {
   } | null;
 }
 
+// --- In-memory single-entry cache for leaderboard data ---
+type CommitWithRepo = GitHubCommit & { repository: string };
+
+interface LeaderboardCacheEntry {
+  reposKey: string;
+  labelKey: string;
+  startDate: Date;
+  endDate: Date;
+  allCommits: CommitWithRepo[];
+  prResults: PRLabelResult[];
+  repositories: Repository[];
+}
+
+let leaderboardCache: LeaderboardCacheEntry | null = null;
+
+function computeReposKey(repos: Repository[]): string {
+  return repos.map(r => `${r.owner}/${r.name}`).sort().join(',');
+}
+
+function computeLabelKey(labelConfig: PRLabelConfig | undefined): string {
+  if (!labelConfig) return 'default';
+  const activeLabels = labelConfig.labels
+    .filter(l => l.enabled)
+    .map(l => `${l.label}:${l.aiTool}`)
+    .sort()
+    .join(',');
+  const scanRepos = [...labelConfig.labelScanRepos].sort().join(',');
+  return `${activeLabels}|${scanRepos}`;
+}
+
+/** Clear the in-memory leaderboard cache (e.g. for a manual refresh). */
+export function clearLeaderboardCache(): void {
+  leaderboardCache = null;
+}
+
+/**
+ * Build LeaderboardData from raw commits and PR results.
+ * Pure computation — no API calls.
+ */
+function analyzeCommits(
+  allCommits: CommitWithRepo[],
+  prResults: PRLabelResult[],
+  repositories: Repository[],
+): LeaderboardData {
+  const aiCommitsWithTool: { commit: CommitWithRepo; aiTool: AITool; claudeModel?: ClaudeModel }[] = [];
+  const globalToolBreakdown = emptyToolBreakdown();
+  const globalModelBreakdown = emptyModelBreakdown();
+
+  allCommits.forEach(commit => {
+    const detection = detectAITool(commit.commit.message);
+    if (detection) {
+      aiCommitsWithTool.push({ commit, ...detection });
+      globalToolBreakdown[detection.aiTool]++;
+      if (detection.claudeModel) {
+        globalModelBreakdown[detection.claudeModel]++;
+      }
+    }
+  });
+
+  // Enrich with PR label data
+  const detectedSHAs = new Set(aiCommitsWithTool.map(entry => entry.commit.sha));
+  const commitBySHA = new Map(allCommits.map(c => [c.sha, c]));
+
+  for (const pr of prResults) {
+    if (detectedSHAs.has(pr.sha)) continue;
+    const commit = commitBySHA.get(pr.sha);
+    if (!commit) continue;
+    aiCommitsWithTool.push({ commit, aiTool: pr.aiTool });
+    globalToolBreakdown[pr.aiTool]++;
+    detectedSHAs.add(pr.sha);
+  }
+
+  // Agent detection
+  {
+    const agentUserSHAs = new Set<string>();
+    for (const commit of allCommits) {
+      const username = commit.author?.login;
+      if (username && username.endsWith('-agent[bot]')) {
+        agentUserSHAs.add(commit.sha);
+      }
+    }
+
+    for (const entry of aiCommitsWithTool) {
+      if (agentUserSHAs.has(entry.commit.sha) && entry.aiTool !== 'agent') {
+        globalToolBreakdown[entry.aiTool]--;
+        entry.aiTool = 'agent';
+        entry.claudeModel = undefined;
+        globalToolBreakdown['agent']++;
+        agentUserSHAs.delete(entry.commit.sha);
+      }
+    }
+
+    for (const commit of allCommits) {
+      if (agentUserSHAs.has(commit.sha)) {
+        aiCommitsWithTool.push({ commit, aiTool: 'agent' });
+        globalToolBreakdown['agent']++;
+      }
+    }
+  }
+
+  // Count total commits by user and collect all commit dates
+  const userTotalCommits = new Map<string, number>();
+  const userAllCommitDates = new Map<string, string[]>();
+  allCommits.forEach(commit => {
+    if (commit.author?.login) {
+      const username = commit.author.login;
+      userTotalCommits.set(username, (userTotalCommits.get(username) || 0) + 1);
+      const dates = userAllCommitDates.get(username) || [];
+      dates.push(commit.commit.author.date);
+      userAllCommitDates.set(username, dates);
+    }
+  });
+
+  // Count AI commits by user
+  const userCommits = new Map<string, {
+    count: number;
+    avatar: string;
+    commits: CommitDetail[];
+    aiToolBreakdown: AIToolBreakdown;
+    claudeModelBreakdown: ClaudeModelBreakdown;
+  }>();
+
+  aiCommitsWithTool.forEach(({ commit, aiTool, claudeModel }) => {
+    if (commit.author?.login) {
+      const username = commit.author.login;
+      const existing = userCommits.get(username) || {
+        count: 0,
+        avatar: commit.author.avatar_url,
+        commits: [],
+        aiToolBreakdown: emptyToolBreakdown(),
+        claudeModelBreakdown: emptyModelBreakdown()
+      };
+
+      const repoInfo = repositories.find(repo => repo.displayName === commit.repository);
+      const repoOwner = repoInfo?.owner || 'unknown';
+      const repoName = repoInfo?.name || 'unknown';
+
+      const commitDetail: CommitDetail = {
+        sha: commit.sha,
+        message: commit.commit.message.split('\n')[0],
+        date: commit.commit.author.date,
+        url: `https://github.com/${repoOwner}/${repoName}/commit/${commit.sha}`,
+        repository: commit.repository,
+        aiTool,
+        claudeModel
+      };
+
+      const updatedToolBreakdown = { ...existing.aiToolBreakdown };
+      updatedToolBreakdown[aiTool]++;
+
+      const updatedModelBreakdown = { ...existing.claudeModelBreakdown };
+      if (claudeModel) {
+        updatedModelBreakdown[claudeModel]++;
+      }
+
+      userCommits.set(username, {
+        count: existing.count + 1,
+        avatar: commit.author.avatar_url,
+        commits: [...existing.commits, commitDetail],
+        aiToolBreakdown: updatedToolBreakdown,
+        claudeModelBreakdown: updatedModelBreakdown
+      });
+    }
+  });
+
+  // Build avatar lookup from all commits
+  const userAvatars = new Map<string, string>();
+  allCommits.forEach(commit => {
+    if (commit.author?.login && commit.author.avatar_url && !userAvatars.has(commit.author.login)) {
+      userAvatars.set(commit.author.login, commit.author.avatar_url);
+    }
+  });
+
+  // Create leaderboard from ALL users (not just AI users)
+  const leaderboard = Array.from(userTotalCommits.entries())
+    .map(([username, totalCommits]) => {
+      const aiData = userCommits.get(username);
+      const avatar = aiData?.avatar || userAvatars.get(username) || '';
+      const aiCount = aiData?.count || 0;
+      const aiPercentage = totalCommits > 0 ? Math.round((aiCount / totalCommits) * 100) : 0;
+
+      return {
+        username,
+        commits: aiCount,
+        totalCommits,
+        aiPercentage,
+        avatar,
+        commitDetails: aiData?.commits || [],
+        allCommitDates: userAllCommitDates.get(username) || [],
+        aiToolBreakdown: aiData?.aiToolBreakdown || emptyToolBreakdown(),
+        claudeModelBreakdown: aiData?.claudeModelBreakdown || emptyModelBreakdown(),
+      };
+    })
+    .sort((a, b) => {
+      if (b.commits !== a.commits) return b.commits - a.commits;
+      return b.totalCommits - a.totalCommits;
+    })
+    .map((entry, index) => ({
+      rank: index + 1,
+      ...entry
+    }));
+
+  return {
+    totalCommits: allCommits.length,
+    aiCommits: aiCommitsWithTool.length,
+    aiToolBreakdown: globalToolBreakdown,
+    claudeModelBreakdown: globalModelBreakdown,
+    activeUsers: userTotalCommits.size,
+    leaderboard
+  };
+}
+
 const emptyToolBreakdown = (): AIToolBreakdown => ({
   'claude-coauthor': 0,
   'claude-generated': 0,
@@ -528,6 +740,26 @@ export async function fetchCommitDataClient(
     startDate.setDate(startDate.getDate() - 7);
   }
 
+  const reposKey = computeReposKey(repositories);
+  const labelKey = computeLabelKey(labelConfig);
+
+  // Check cache: exact match or subset interval
+  if (leaderboardCache && leaderboardCache.reposKey === reposKey && leaderboardCache.labelKey === labelKey) {
+    if (startDate >= leaderboardCache.startDate && endDate <= leaderboardCache.endDate) {
+      // Cached data covers this interval — filter and re-analyze
+      const filteredCommits = leaderboardCache.allCommits.filter(c => {
+        const d = new Date(c.commit.author.date);
+        return d >= startDate && d <= endDate;
+      });
+      const filteredPRs = leaderboardCache.prResults.filter(pr => {
+        if (!pr.date) return false;
+        const d = new Date(pr.date);
+        return d >= startDate && d <= endDate;
+      });
+      return analyzeCommits(filteredCommits, filteredPRs, leaderboardCache.repositories);
+    }
+  }
+
   const headers: HeadersInit = {
     'Accept': 'application/vnd.github.v3+json',
     'Authorization': `Bearer ${token}`,
@@ -544,7 +776,7 @@ export async function fetchCommitDataClient(
     };
   }
 
-  const allCommits: (GitHubCommit & { repository: string })[] = [];
+  const allCommits: CommitWithRepo[] = [];
 
   // Phase 1: Count total commits across all repos (1 lightweight request per repo)
   let totalCommitsEstimate: number | null = null;
@@ -649,24 +881,7 @@ export async function fetchCommitDataClient(
     phase: 'analyzing',
   });
 
-  // Process commits
-  const aiCommitsWithTool: { commit: typeof allCommits[0]; aiTool: AITool; claudeModel?: ClaudeModel }[] = [];
-  const globalToolBreakdown = emptyToolBreakdown();
-  const globalModelBreakdown = emptyModelBreakdown();
-
-  allCommits.forEach(commit => {
-    const detection = detectAITool(commit.commit.message);
-    if (detection) {
-      aiCommitsWithTool.push({ commit, ...detection });
-      globalToolBreakdown[detection.aiTool]++;
-
-      if (detection.claudeModel) {
-        globalModelBreakdown[detection.claudeModel]++;
-      }
-    }
-  });
-
-  // Phase 3: Enrich with PR label data
+  // Phase 3: Fetch PR label data
   onProgress?.({
     completedRepos: repositories.length,
     totalRepos: repositories.length,
@@ -676,8 +891,9 @@ export async function fetchCommitDataClient(
     phase: 'fetching-prs',
   });
 
+  let prResults: PRLabelResult[] = [];
   try {
-    const prResults = await fetchAILabeledPRs(
+    prResults = await fetchAILabeledPRs(
       token,
       repositories,
       startDate,
@@ -697,171 +913,22 @@ export async function fetchCommitDataClient(
       },
       labelConfig,
     );
-
-    // Build set of already-detected AI commit SHAs
-    const detectedSHAs = new Set(aiCommitsWithTool.map(entry => entry.commit.sha));
-
-    // Build SHA-to-commit index for fast lookup
-    const commitBySHA = new Map(allCommits.map(c => [c.sha, c]));
-
-    for (const pr of prResults) {
-      if (detectedSHAs.has(pr.sha)) continue; // already detected, skip
-
-      const commit = commitBySHA.get(pr.sha);
-      if (!commit) continue; // merge commit not in our fetched commits
-
-      aiCommitsWithTool.push({ commit, aiTool: pr.aiTool });
-      globalToolBreakdown[pr.aiTool]++;
-      detectedSHAs.add(pr.sha);
-    }
   } catch (err) {
     console.error('Failed to fetch AI-labeled PRs:', err);
-    // Continue without PR label data
   }
 
-  // Agent detection: all commits from -agent[bot] suffixed users are tagged as 'agent',
-  // even if they were already detected via co-author trailers or PR labels.
-  {
-    const agentUserSHAs = new Set<string>();
-    for (const commit of allCommits) {
-      const username = commit.author?.login;
-      if (username && username.endsWith('-agent[bot]')) {
-        agentUserSHAs.add(commit.sha);
-      }
-    }
-
-    // Re-tag any already-detected commits from agent users
-    for (const entry of aiCommitsWithTool) {
-      if (agentUserSHAs.has(entry.commit.sha) && entry.aiTool !== 'agent') {
-        globalToolBreakdown[entry.aiTool]--;
-        entry.aiTool = 'agent';
-        entry.claudeModel = undefined;
-        globalToolBreakdown['agent']++;
-        agentUserSHAs.delete(entry.commit.sha);
-      }
-    }
-
-    // Add any remaining agent commits not yet detected
-    for (const commit of allCommits) {
-      if (agentUserSHAs.has(commit.sha)) {
-        aiCommitsWithTool.push({ commit, aiTool: 'agent' });
-        globalToolBreakdown['agent']++;
-      }
-    }
-  }
-
-  // Count total commits by user and collect all commit dates
-  const userTotalCommits = new Map<string, number>();
-  const userAllCommitDates = new Map<string, string[]>();
-  allCommits.forEach(commit => {
-    if (commit.author?.login) {
-      const username = commit.author.login;
-      userTotalCommits.set(username, (userTotalCommits.get(username) || 0) + 1);
-      const dates = userAllCommitDates.get(username) || [];
-      dates.push(commit.commit.author.date);
-      userAllCommitDates.set(username, dates);
-    }
-  });
-
-  // Count AI commits by user
-  const userCommits = new Map<string, {
-    count: number;
-    avatar: string;
-    commits: CommitDetail[];
-    aiToolBreakdown: AIToolBreakdown;
-    claudeModelBreakdown: ClaudeModelBreakdown;
-  }>();
-
-  aiCommitsWithTool.forEach(({ commit, aiTool, claudeModel }) => {
-    if (commit.author?.login) {
-      const username = commit.author.login;
-      const existing = userCommits.get(username) || {
-        count: 0,
-        avatar: commit.author.avatar_url,
-        commits: [],
-        aiToolBreakdown: emptyToolBreakdown(),
-        claudeModelBreakdown: emptyModelBreakdown()
-      };
-
-      const repoInfo = repositories.find(repo => repo.displayName === commit.repository);
-      const repoOwner = repoInfo?.owner || 'unknown';
-      const repoName = repoInfo?.name || 'unknown';
-
-      const commitDetail: CommitDetail = {
-        sha: commit.sha,
-        message: commit.commit.message.split('\n')[0],
-        date: commit.commit.author.date,
-        url: `https://github.com/${repoOwner}/${repoName}/commit/${commit.sha}`,
-        repository: commit.repository,
-        aiTool,
-        claudeModel
-      };
-
-      const updatedToolBreakdown = { ...existing.aiToolBreakdown };
-      updatedToolBreakdown[aiTool]++;
-
-      const updatedModelBreakdown = { ...existing.claudeModelBreakdown };
-      if (claudeModel) {
-        updatedModelBreakdown[claudeModel]++;
-      }
-
-      userCommits.set(username, {
-        count: existing.count + 1,
-        avatar: commit.author.avatar_url,
-        commits: [...existing.commits, commitDetail],
-        aiToolBreakdown: updatedToolBreakdown,
-        claudeModelBreakdown: updatedModelBreakdown
-      });
-    }
-  });
-
-  // Build avatar lookup from all commits
-  const userAvatars = new Map<string, string>();
-  allCommits.forEach(commit => {
-    if (commit.author?.login && commit.author.avatar_url && !userAvatars.has(commit.author.login)) {
-      userAvatars.set(commit.author.login, commit.author.avatar_url);
-    }
-  });
-
-  // Create leaderboard from ALL users (not just AI users)
-  const leaderboard = Array.from(userTotalCommits.entries())
-    .map(([username, totalCommits]) => {
-      const aiData = userCommits.get(username);
-      const avatar = aiData?.avatar || userAvatars.get(username) || '';
-      const aiCount = aiData?.count || 0;
-      const aiPercentage = totalCommits > 0 ? Math.round((aiCount / totalCommits) * 100) : 0;
-
-      return {
-        username,
-        commits: aiCount,
-        totalCommits,
-        aiPercentage,
-        avatar,
-        commitDetails: aiData?.commits || [],
-        allCommitDates: userAllCommitDates.get(username) || [],
-        aiToolBreakdown: aiData?.aiToolBreakdown || emptyToolBreakdown(),
-        claudeModelBreakdown: aiData?.claudeModelBreakdown || emptyModelBreakdown(),
-      };
-    })
-    .sort((a, b) => {
-      // Primary: AI commits descending (AI users first)
-      if (b.commits !== a.commits) return b.commits - a.commits;
-      // Secondary: total commits descending
-      return b.totalCommits - a.totalCommits;
-    })
-    .map((entry, index) => ({
-      rank: index + 1,
-      ...entry
-    }));
-
-  return {
-    totalCommits: allCommits.length,
-    aiCommits: aiCommitsWithTool.length,
-    aiToolBreakdown: globalToolBreakdown,
-    claudeModelBreakdown: globalModelBreakdown,
-    activeUsers: userTotalCommits.size,
-    leaderboard
+  // Store raw data in cache for future subset queries
+  leaderboardCache = {
+    reposKey,
+    labelKey,
+    startDate,
+    endDate,
+    allCommits,
+    prResults,
+    repositories,
   };
+
+  return analyzeCommits(allCommits, prResults, repositories);
 }
 
 
