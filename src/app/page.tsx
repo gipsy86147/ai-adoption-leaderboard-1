@@ -10,8 +10,7 @@ import { Header } from '@/components/Header';
 import { DateRangeSelector } from '@/components/DateRangeSelector';
 import { RepositorySelector } from '@/components/RepositorySelector';
 import { PRLabelConfig } from '@/components/PRLabelConfig';
-import { TokenAuth } from '@/components/TokenAuth';
-import { OAuthLogin } from '@/components/OAuthLogin';
+import { DeviceFlowAuth } from '@/components/DeviceFlowAuth';
 import {
   type Repository,
   type AIToolBreakdown,
@@ -23,9 +22,13 @@ import {
   fetchCommitDataClient,
   getDefaultPRLabelConfig,
 } from '@/lib/github-client';
-
-// Check if OAuth is available (client-side check)
-const isOAuthAvailable = !!process.env.NEXT_PUBLIC_GITHUB_CLIENT_ID;
+import {
+  loadAuthState,
+  clearAuthState,
+  fetchUserRepos,
+  validateToken,
+  type GitHubUser,
+} from '@/lib/github-device-auth';
 
 function HomeContent() {
   const searchParams = useSearchParams();
@@ -44,7 +47,6 @@ function HomeContent() {
   // Repository state
   const [repositories, setRepositories] = useState<Repository[]>([]);
   const [selectedRepos, setSelectedRepos] = useState<string[]>([]);
-  const [hasMoreRepos, setHasMoreRepos] = useState(false);
 
   const emptyToolBreakdown = useMemo<AIToolBreakdown>(() => ({
     'claude-coauthor': 0,
@@ -153,82 +155,76 @@ function HomeContent() {
     updateUrlWithRepos(newSelectedRepos);
   }, [updateUrlWithRepos]);
 
-  // Load auth state on mount — always use session endpoint (works for both OAuth and PAT)
+  // Complete auth setup: fetch repos and restore URL state
+  const completeAuthSetup = useCallback(async (authToken: string, authUser: { login: string; avatar_url: string }) => {
+    setToken(authToken);
+    setUser(authUser);
+    setIsAuthenticated(true);
+
+    try {
+      const { repos } = await fetchUserRepos(authToken);
+      const mappedRepos: Repository[] = repos.map(r => ({
+        owner: r.owner,
+        name: r.name,
+        displayName: r.displayName,
+      }));
+      setRepositories(mappedRepos);
+
+      // Restore selected repos from URL
+      const reposFromUrl = searchParams.get('repos');
+      if (reposFromUrl) {
+        try {
+          const decodedRepos = JSON.parse(decodeURIComponent(reposFromUrl));
+          const validRepos = decodedRepos.filter((repoName: string) =>
+            mappedRepos.some((repo: Repository) => repo.name === repoName)
+          );
+          setSelectedRepos(validRepos);
+
+          // Init label scan repos if no stored config
+          if (!localStorage.getItem('prLabelConfig') && validRepos.length > 0) {
+            const defaultConfig = getDefaultPRLabelConfig(validRepos);
+            setLabelConfig(defaultConfig);
+            localStorage.setItem('prLabelConfig', JSON.stringify(defaultConfig));
+          }
+        } catch {
+          setSelectedRepos([]);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch repositories:', err);
+      setError('Failed to load repositories. Please try logging in again.');
+    }
+  }, [searchParams]);
+
+  // Load auth state from localStorage on mount
   useEffect(() => {
     const initAuth = async () => {
-      // Check for error from OAuth redirect
-      const errorParam = searchParams.get('error');
-      if (errorParam) {
-        setError(decodeURIComponent(errorParam));
-        const params = new URLSearchParams(searchParams.toString());
-        params.delete('error');
-        router.replace(params.toString() ? `${pathname}?${params.toString()}` : pathname, { scroll: false });
-        setIsInitializing(false);
-        return;
-      }
+      const authState = loadAuthState();
 
-      // Check session endpoint — handles both OAuth (cookie) and PAT (.env.local) modes
-      try {
-        const sessionResponse = await fetch('/api/auth/session');
-        const session = await sessionResponse.json();
-
-        if (session.authenticated && session.accessToken) {
-          setToken(session.accessToken);
-          setUser(session.user);
-          setIsAuthenticated(true);
-
-          // Fetch first page of repositories via server-side endpoint
-          try {
-            const reposResponse = await fetch('/api/repos?page=1');
-            if (!reposResponse.ok) throw new Error('Failed to fetch repositories');
-            const { repos, hasMore } = await reposResponse.json();
-            setRepositories(repos);
-            setHasMoreRepos(hasMore);
-
-            // Restore selected repos from URL
-            const reposFromUrl = searchParams.get('repos');
-            if (reposFromUrl) {
-              try {
-                const decodedRepos = JSON.parse(decodeURIComponent(reposFromUrl));
-                const validRepos = decodedRepos.filter((repoName: string) =>
-                  repos.some((repo: Repository) => repo.name === repoName)
-                );
-                setSelectedRepos(validRepos);
-
-                // Init label scan repos if no stored config
-                if (!localStorage.getItem('prLabelConfig') && validRepos.length > 0) {
-                  const defaultConfig = getDefaultPRLabelConfig(validRepos);
-                  setLabelConfig(defaultConfig);
-                  localStorage.setItem('prLabelConfig', JSON.stringify(defaultConfig));
-                }
-              } catch {
-                setSelectedRepos([]);
-              }
-            }
-          } catch (err) {
-            console.error('Failed to fetch repositories:', err);
-            setError('Failed to load repositories. Please try logging in again.');
-          }
-
-          setIsInitializing(false);
-          return;
+      if (authState.isAuthenticated && authState.token && authState.user) {
+        // Validate the stored token is still valid
+        const isValid = await validateToken(authState.token);
+        if (isValid) {
+          await completeAuthSetup(authState.token, authState.user);
+        } else {
+          // Token expired — clear and show login
+          clearAuthState();
         }
-      } catch (err) {
-        console.error('Failed to check session:', err);
       }
 
       setIsInitializing(false);
     };
 
     initAuth();
-  }, [searchParams, router, pathname]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Handle successful authentication (from TokenAuth — triggers page reload so this is mainly a fallback)
-  const handleAuthenticated = useCallback(async () => {
-    // TokenAuth now saves to .env.local and reloads the page,
-    // so initAuth will pick up the session on next load.
-    window.location.reload();
-  }, []);
+  // Handle successful Device Flow authentication
+  const handleAuthenticated = useCallback(async (authToken: string, authUser: GitHubUser) => {
+    await completeAuthSetup(authToken, {
+      login: authUser.login,
+      avatar_url: authUser.avatar_url,
+    });
+  }, [completeAuthSetup]);
 
   // Fetch commit data
   const fetchData = useCallback(async () => {
@@ -282,16 +278,8 @@ function HomeContent() {
     }
   }, [fetchData, isAuthenticated, selectedRepos.length]);
 
-  const handleLogout = useCallback(async () => {
-    // Clear server-side session if using OAuth
-    if (isOAuthAvailable) {
-      try {
-        await fetch('/api/auth/session', { method: 'DELETE' });
-      } catch (err) {
-        console.error('Failed to clear server session:', err);
-      }
-    }
-
+  const handleLogout = useCallback(() => {
+    clearAuthState();
     setIsAuthenticated(false);
     setToken(null);
     setUser(null);
@@ -343,11 +331,7 @@ function HomeContent() {
         <div className="container mx-auto px-4 py-8 max-w-7xl">
           <Header />
           <div className="flex items-center justify-center py-16">
-            {isOAuthAvailable ? (
-              <OAuthLogin />
-            ) : (
-              <TokenAuth onAuthenticated={handleAuthenticated} />
-            )}
+            <DeviceFlowAuth onAuthenticated={handleAuthenticated} />
           </div>
         </div>
       </div>
@@ -370,11 +354,7 @@ function HomeContent() {
           selectedRepos={selectedRepos}
           onRepoChange={handleRepoChange}
           availableRepos={repositories}
-          hasMoreRepos={hasMoreRepos}
-          onReposLoaded={(repos, hasMore) => {
-            setRepositories(repos);
-            setHasMoreRepos(hasMore);
-          }}
+          token={token}
         />
 
         <PRLabelConfig

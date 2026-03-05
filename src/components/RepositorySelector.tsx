@@ -13,32 +13,66 @@ interface RepositorySelectorProps {
   selectedRepos: string[];
   onRepoChange: (selectedRepos: string[]) => void;
   availableRepos: Repository[];
-  hasMoreRepos: boolean;
-  onReposLoaded: (repos: Repository[], hasMore: boolean) => void;
+  token: string | null;
+}
+
+async function searchReposClient(
+  token: string,
+  query: string,
+): Promise<Repository[]> {
+  const headers: HeadersInit = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github.v3+json',
+  };
+
+  // Get user login and orgs for scoped search
+  const [userRes, orgsRes] = await Promise.all([
+    fetch('https://api.github.com/user', { headers }),
+    fetch('https://api.github.com/user/orgs?per_page=100', { headers }),
+  ]);
+
+  const user = userRes.ok ? await userRes.json() : null;
+  const orgs = orgsRes.ok ? await orgsRes.json() : [];
+
+  const qualifiers = [
+    user ? `user:${user.login}` : '',
+    ...orgs.map((org: { login: string }) => `org:${org.login}`),
+  ].filter(Boolean);
+
+  const q = `${query} ${qualifiers.join(' ')}`;
+  const response = await fetch(
+    `https://api.github.com/search/repositories?q=${encodeURIComponent(q)}&per_page=30`,
+    { headers },
+  );
+
+  if (!response.ok) return [];
+
+  const data = await response.json();
+  return (data.items || []).map(
+    (repo: { owner: { login: string }; name: string; full_name: string }) => ({
+      owner: repo.owner.login,
+      name: repo.name,
+      displayName: repo.full_name,
+    }),
+  );
 }
 
 export function RepositorySelector({
   selectedRepos,
   onRepoChange,
   availableRepos,
-  hasMoreRepos,
-  onReposLoaded,
+  token,
 }: RepositorySelectorProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<Repository[] | null>(null);
-  const [searchHasMore, setSearchHasMore] = useState(false);
-  const [searchPage, setSearchPage] = useState(1);
   const [isSearching, setIsSearching] = useState(false);
-  const [isLoadingMore, setIsLoadingMore] = useState(false);
-  const [browsePage, setBrowsePage] = useState(1);
   const [isOpen, setIsOpen] = useState(true);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // The repos to display: search results when searching, otherwise the initial loaded repos
   const displayedRepos = searchResults ?? availableRepos;
-  const displayedHasMore = searchResults ? searchHasMore : hasMoreRepos;
 
-  // Debounced search
+  // Debounced search — calls GitHub search API directly from browser
   useEffect(() => {
     if (debounceRef.current) {
       clearTimeout(debounceRef.current);
@@ -47,23 +81,17 @@ export function RepositorySelector({
     const query = searchQuery.trim();
     if (!query) {
       setSearchResults(null);
-      setSearchHasMore(false);
-      setSearchPage(1);
       setIsSearching(false);
       return;
     }
 
+    if (!token) return;
+
     setIsSearching(true);
     debounceRef.current = setTimeout(async () => {
       try {
-        const response = await fetch(
-          `/api/repos?search=${encodeURIComponent(query)}&page=1`
-        );
-        if (!response.ok) throw new Error('Search failed');
-        const data = await response.json();
-        setSearchResults(data.repos);
-        setSearchHasMore(data.hasMore);
-        setSearchPage(1);
+        const repos = await searchReposClient(token, query);
+        setSearchResults(repos);
       } catch (err) {
         console.error('Search error:', err);
       } finally {
@@ -76,38 +104,7 @@ export function RepositorySelector({
         clearTimeout(debounceRef.current);
       }
     };
-  }, [searchQuery]);
-
-  const handleLoadMore = useCallback(async () => {
-    setIsLoadingMore(true);
-    try {
-      const query = searchQuery.trim();
-      if (query) {
-        // Load more search results
-        const nextPage = searchPage + 1;
-        const response = await fetch(
-          `/api/repos?search=${encodeURIComponent(query)}&page=${nextPage}`
-        );
-        if (!response.ok) throw new Error('Failed to load more');
-        const data = await response.json();
-        setSearchResults((prev) => [...(prev ?? []), ...data.repos]);
-        setSearchHasMore(data.hasMore);
-        setSearchPage(nextPage);
-      } else {
-        // Load more browse results
-        const nextPage = browsePage + 1;
-        const response = await fetch(`/api/repos?page=${nextPage}`);
-        if (!response.ok) throw new Error('Failed to load more');
-        const data = await response.json();
-        onReposLoaded([...availableRepos, ...data.repos], data.hasMore);
-        setBrowsePage(nextPage);
-      }
-    } catch (err) {
-      console.error('Load more error:', err);
-    } finally {
-      setIsLoadingMore(false);
-    }
-  }, [searchQuery, searchPage, browsePage, availableRepos, onReposLoaded]);
+  }, [searchQuery, token]);
 
   const handleRepoToggle = (repoName: string) => {
     if (selectedRepos.includes(repoName)) {
@@ -236,56 +233,33 @@ export function RepositorySelector({
                   </p>
                 </div>
               ) : (
-                <>
-                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
-                    {displayedRepos.map((repo) => {
-                      const isSelected = selectedRepos.includes(repo.name);
-                      return (
-                        <div
-                          key={repo.displayName}
-                          className={cn(
-                            'flex items-center gap-2 rounded-lg border px-3 py-2 transition-colors cursor-pointer min-w-0',
-                            isSelected
-                              ? 'bg-primary/5 border-primary/20 hover:bg-primary/10'
-                              : 'hover:bg-muted/50'
-                          )}
-                          onClick={() => handleRepoToggle(repo.name)}
-                        >
-                          <Checkbox
-                            checked={isSelected}
-                            onCheckedChange={() => handleRepoToggle(repo.name)}
-                            className="flex-shrink-0"
-                          />
-                          <GitBranch className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
-                          <span className="text-sm font-medium truncate">
-                            {repo.displayName}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  {/* Load More button */}
-                  {displayedHasMore && (
-                    <div className="pt-2 flex justify-center">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={handleLoadMore}
-                        disabled={isLoadingMore}
-                      >
-                        {isLoadingMore ? (
-                          <>
-                            <Loader2 className="h-4 w-4 mr-1 animate-spin" />
-                            Loading...
-                          </>
-                        ) : (
-                          'Load More'
+                <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
+                  {displayedRepos.map((repo) => {
+                    const isSelected = selectedRepos.includes(repo.name);
+                    return (
+                      <div
+                        key={repo.displayName}
+                        className={cn(
+                          'flex items-center gap-2 rounded-lg border px-3 py-2 transition-colors cursor-pointer min-w-0',
+                          isSelected
+                            ? 'bg-primary/5 border-primary/20 hover:bg-primary/10'
+                            : 'hover:bg-muted/50'
                         )}
-                      </Button>
-                    </div>
-                  )}
-                </>
+                        onClick={() => handleRepoToggle(repo.name)}
+                      >
+                        <Checkbox
+                          checked={isSelected}
+                          onCheckedChange={() => handleRepoToggle(repo.name)}
+                          className="flex-shrink-0"
+                        />
+                        <GitBranch className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                        <span className="text-sm font-medium truncate">
+                          {repo.displayName}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
               )}
             </div>
 
