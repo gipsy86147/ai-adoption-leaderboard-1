@@ -1,8 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // Disable static export - we need server-side routes for OAuth
-  // output: 'export',
+  output: 'export',
 
   // Disable image optimization for external GitHub avatars
   images: {
