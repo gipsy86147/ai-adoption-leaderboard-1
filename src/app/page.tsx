@@ -155,11 +155,14 @@ function HomeContent() {
     updateUrlWithRepos(newSelectedRepos);
   }, [updateUrlWithRepos]);
 
+  // Loading repos state
+  const [isLoadingRepos, setIsLoadingRepos] = useState(false);
+
   // Complete auth setup: fetch repos and restore URL state
   const completeAuthSetup = useCallback(async (authToken: string, authUser: { login: string; avatar_url: string }) => {
     setToken(authToken);
     setUser(authUser);
-    setIsAuthenticated(true);
+    setIsLoadingRepos(true);
 
     try {
       const { repos } = await fetchUserRepos(authToken);
@@ -193,6 +196,9 @@ function HomeContent() {
     } catch (err) {
       console.error('Failed to fetch repositories:', err);
       setError('Failed to load repositories. Please try logging in again.');
+    } finally {
+      setIsAuthenticated(true);
+      setIsLoadingRepos(false);
     }
   }, [searchParams]);
 
@@ -325,13 +331,28 @@ function HomeContent() {
   }
 
   // Show auth prompt if not authenticated
-  if (!isAuthenticated) {
+  if (!isAuthenticated && !isLoadingRepos) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50/30 to-indigo-50/40 dark:from-slate-950 dark:via-slate-900 dark:to-slate-800">
         <div className="container mx-auto px-4 py-8 max-w-7xl">
           <Header />
           <div className="flex items-center justify-center py-16">
             <DeviceFlowAuth onAuthenticated={handleAuthenticated} />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Show loading while fetching repositories after auth
+  if (isLoadingRepos) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50/30 to-indigo-50/40 dark:from-slate-950 dark:via-slate-900 dark:to-slate-800">
+        <div className="container mx-auto px-4 py-8 max-w-7xl">
+          <Header />
+          <div className="flex flex-col items-center justify-center py-16 gap-4">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary"></div>
+            <p className="text-sm text-muted-foreground">Loading your repositories...</p>
           </div>
         </div>
       </div>
