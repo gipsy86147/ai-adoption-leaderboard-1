@@ -298,75 +298,60 @@ export interface FetchReposResultDevice {
  * Also returns list of organizations that denied access
  */
 export async function fetchUserRepos(token: string): Promise<FetchReposResultDevice> {
-  const repos: DeviceRepo[] = [];
+  const headers = {
+    'Authorization': `Bearer ${token}`,
+    'Accept': 'application/vnd.github.v3+json',
+  };
+
+  const mapRepo = (repo: { owner: { login: string }; name: string; full_name: string; private: boolean }): DeviceRepo => ({
+    owner: repo.owner.login,
+    name: repo.name,
+    displayName: repo.full_name,
+    fullName: repo.full_name,
+    private: repo.private,
+  });
+
+  // Kick off orgs fetch first (orgs are the slow part — multiple paginated fetches per org)
+  const orgsPromise = fetchUserOrgsDevice(token);
+
+  // Fetch user repos in parallel with orgs
+  const userReposPromise = (async () => {
+    const result: DeviceRepo[] = [];
+    for (let page = 1; page <= 10; page++) {
+      const response = await fetch(
+        `${GITHUB_API_URL}/user/repos?per_page=100&page=${page}&sort=pushed&direction=desc`,
+        { headers },
+      );
+      if (!response.ok) throw new Error('Failed to fetch repositories');
+      const pageRepos = await response.json();
+      if (pageRepos.length === 0) break;
+      result.push(...pageRepos.map(mapRepo));
+      if (pageRepos.length < 100) break;
+    }
+    return result;
+  })();
+
+  // Once orgs list is ready, fetch all org repos in parallel
+  const orgs = await orgsPromise;
   const deniedOrgs: string[] = [];
-
-  let page = 1;
-  const perPage = 100;
-
-  // First, fetch user's own repos
-  while (true) {
-    const response = await fetch(
-      `${GITHUB_API_URL}/user/repos?per_page=${perPage}&page=${page}&sort=pushed&direction=desc`,
-      {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Accept': 'application/vnd.github.v3+json',
-        },
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error('Failed to fetch repositories');
-    }
-
-    const pageRepos = await response.json();
-
-    if (pageRepos.length === 0) {
-      break;
-    }
-
-    repos.push(...pageRepos.map((repo: { owner: { login: string }; name: string; full_name: string; private: boolean }) => ({
-      owner: repo.owner.login,
-      name: repo.name,
-      displayName: repo.full_name,
-      fullName: repo.full_name,
-      private: repo.private,
-    })));
-
-    if (pageRepos.length < perPage) {
-      break;
-    }
-
-    page++;
-
-    // Safety limit
-    if (page > 10) {
-      break;
-    }
-  }
-
-  // Fetch user's organizations
-  const orgs = await fetchUserOrgsDevice(token);
-
-  // Fetch repos from each organization
-  for (const org of orgs) {
+  const orgReposPromises = orgs.map(async (org) => {
     const result = await fetchOrgReposDevice(token, org);
     if (result.accessDenied) {
       deniedOrgs.push(org);
-    } else {
-      repos.push(...result.repos);
+      return [];
     }
-  }
+    return result.repos;
+  });
+
+  // Wait for user repos + all org repos
+  const [userRepos, ...orgReposArrays] = await Promise.all([userReposPromise, ...orgReposPromises]);
+  const repos = [...userRepos, ...orgReposArrays.flat()];
 
   // Deduplicate repos by full name (user/repos may overlap with org repos)
   const seen = new Set<string>();
   const uniqueRepos = repos.filter(repo => {
-    const key = repo.displayName;
-    if (seen.has(key)) {
-      return false;
-    }
-    seen.add(key);
+    if (seen.has(repo.displayName)) return false;
+    seen.add(repo.displayName);
     return true;
   });
 
